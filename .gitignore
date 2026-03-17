@@ -1,0 +1,14 @@
+# CMake 编译目录和缓存
+build/
+out/
+.cache/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# IDE 配置文件
+.vscode/
+.idea/
+
+# 如果 third 文件夹里全是你不想传的第三方巨大源码，可以解开下面的注释
+# third/
