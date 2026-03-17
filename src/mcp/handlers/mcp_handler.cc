@@ -26,7 +26,7 @@ void McpHandler::register_routes(mcp::server::McpServer& server) {
     // 1. 初始化握手
     // =========================================================
     dispatcher.register_method("initialize", [](const json& params) -> seastar::future<json> {
-        std::cout << "\n[MCP 状态] 收到 initialize 请求\n";
+        //std::cout << "\n[MCP 状态] 收到 initialize 请求\n";
         json result;
         result["protocolVersion"] = "2024-11-05";
         result["serverInfo"] = {{"name", "my-seastar-mcp"}, {"version", "1.0.0"}};
@@ -35,7 +35,7 @@ void McpHandler::register_routes(mcp::server::McpServer& server) {
     });
     
     dispatcher.register_notification("notifications/initialized", [](const json& params) -> seastar::future<> {
-        std::cout << "[MCP 状态] 客户端已就绪！\n";
+        //std::cout << "[MCP 状态] 客户端已就绪！\n";
         co_return; 
     });
 
@@ -43,7 +43,7 @@ void McpHandler::register_routes(mcp::server::McpServer& server) {
     // 2. 获取工具列表 (完全自动化！)
     // =========================================================
     dispatcher.register_method("tools/list", [tool_manager](const json& params) -> seastar::future<json> {
-        std::cout << "[MCP 工具] 客户端请求工具列表 (tools/list)\n";
+        //std::cout << "[MCP 工具] 客户端请求工具列表 (tools/list)\n";
         json result;
         result["tools"] = tool_manager->get_all_tools_list();
         co_return result;
@@ -56,7 +56,7 @@ void McpHandler::register_routes(mcp::server::McpServer& server) {
         std::string name = params.value("name", "");
         json args = params.value("arguments", json::object());
         
-        std::cout << "\n[MCP 工具] 客户端调用了工具: " << name << "\n";
+        //std::cout << "\n[MCP 工具] 客户端调用了工具: " << name << "\n";
         
         // 直接让 manager 接管执行
         co_return co_await tool_manager->call_tool(name, args);

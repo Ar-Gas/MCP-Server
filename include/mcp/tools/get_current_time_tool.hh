@@ -24,7 +24,7 @@ public:
         std::string time_str = std::ctime(&now_c);
         if (!time_str.empty() && time_str.back() == '\n') time_str.pop_back();
         
-        std::cout << "          -> [独立类执行] 获取时间: " << time_str << "\n";
+        //std::cout << "          -> [独立类执行] 获取时间: " << time_str << "\n";
         
         nlohmann::json result;
         result["content"] = nlohmann::json::array({{{"type", "text"}, {"text", "当前服务器时间是: " + time_str}}});

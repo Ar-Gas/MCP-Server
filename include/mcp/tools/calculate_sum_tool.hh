@@ -26,7 +26,7 @@ public:
     seastar::future<nlohmann::json> execute(const nlohmann::json& args) override {
         double a = args.value("a", 0.0);
         double b = args.value("b", 0.0);
-        std::cout << "          -> [独立类执行] 参数: a=" << a << ", b=" << b << "\n";
+        //std::cout << "          -> [独立类执行] 参数: a=" << a << ", b=" << b << "\n";
         
         nlohmann::json result;
         result["content"] = nlohmann::json::array({{{"type", "text"}, {"text", "计算结果是: " + std::to_string(a + b)}}});

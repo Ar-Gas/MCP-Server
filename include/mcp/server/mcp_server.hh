@@ -29,7 +29,7 @@ namespace mcp::server {
             std::string body(body_view);
 
             // 【可选】打印出来看看，方便确认客户端发了什么
-            std::cout << "[HTTP Debug] Received body: " << body << std::endl;
+            //std::cout << "[HTTP Debug] Received body: " << body << std::endl;
 
             // =========================================================
             // 3. 交给 Dispatcher 处理
