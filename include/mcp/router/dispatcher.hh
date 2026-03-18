@@ -1,18 +1,16 @@
 #pragma once
 #include <seastar/core/future.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/util/log.hh>  // 加入头文件
 #include "mcp/protocol/json_rpc.hh"
 #include <unordered_map>
 #include <functional>
-#include <iostream>
-
 namespace mcp::router {
-
 using namespace mcp::protocol;
-
 using MethodHandler = std::function<seastar::future<json>(const json&)>;
 using NotificationHandler = std::function<seastar::future<>(const json&)>;
-
+// 专门给 RPC 调度器用的 logger
+inline seastar::logger rpc_log("rpc_dispatcher");
 class JsonRpcDispatcher {
 private:
     std::unordered_map<std::string, MethodHandler> _methods;
@@ -28,10 +26,12 @@ public:
     }
 
     seastar::future<std::optional<std::string>> handle_request(const std::string& raw_body) {
+        rpc_log.debug("Raw request received: {}", raw_body);
         json req_json;
         try {
             req_json = json::parse(raw_body);
         } catch (...) {
+            rpc_log.error("Failed to parse JSON request");
             JsonRpcResponse err{"2.0", nullptr, nullptr, 
                 JsonRpcError{static_cast<int>(JsonRpcErrorCode::ParseError), "Parse error", nullptr}};
             co_return json(err).dump();

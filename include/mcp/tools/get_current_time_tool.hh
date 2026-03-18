@@ -1,12 +1,14 @@
 #pragma once
-#include "mcp/tools/mcp_tool.hh"
+#include "mcp/interfaces.hh"
 #include <chrono>
 #include <ctime>
 #include <iostream>
 
 namespace mcp::tools {
 
-class GetCurrentTimeTool : public McpTool {
+inline seastar::logger time_log("tools-get_current_time"); // 定义工具模块的日志器
+
+class GetCurrentTimeTool : public mcp::interfaces::McpTool {
 public:
     std::string get_name() const override { return "get_current_time"; }
 
@@ -24,7 +26,7 @@ public:
         std::string time_str = std::ctime(&now_c);
         if (!time_str.empty() && time_str.back() == '\n') time_str.pop_back();
         
-        //std::cout << "          -> [独立类执行] 获取时间: " << time_str << "\n";
+        time_log.info("Executing get_current_time: {}", time_str);
         
         nlohmann::json result;
         result["content"] = nlohmann::json::array({{{"type", "text"}, {"text", "当前服务器时间是: " + time_str}}});

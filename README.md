@@ -181,3 +181,21 @@ curl -X POST http://127.0.0.1:8080/message \
 tool_manager->register_tool(std::make_shared<mcp::tools::MyAwesomeTool>());
 ```
 重新编译运行，系统会自动将其暴露给所有的 AI 客户端，无需改动任何网络路由代码！
+
+##  claude desktop 配置
+
+``` json
+{
+  "mcpServers": {
+    "seastar_cpp_tools": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "my-seastar-mcp:v1"
+      ]
+    }
+  }
+}
+```

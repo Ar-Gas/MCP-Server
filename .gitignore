@@ -5,7 +5,7 @@ out/
 CMakeCache.txt
 CMakeFiles/
 compile_commands.json
-
+my-seastar-mcp.tar.gz
 # IDE 配置文件
 .vscode/
 .idea/

@@ -1,79 +1,91 @@
 #pragma once
 #include <seastar/core/future.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/queue.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
-#include <seastar/http/reply.hh>
-#include <seastar/http/request.hh>
+#include <seastar/http/function_handlers.hh>
 #include "mcp/router/dispatcher.hh"
 
 namespace mcp::server {
 
-    class McpHandler : public seastar::httpd::handler_base {
-        mcp::router::JsonRpcDispatcher& _dispatcher;
-    public:
-        McpHandler(mcp::router::JsonRpcDispatcher& dispatcher) : _dispatcher(dispatcher) {}
-
-        virtual seastar::future<std::unique_ptr<seastar::http::reply>> handle(
-            const seastar::sstring& path,
-            std::unique_ptr<seastar::http::request> req,
-            std::unique_ptr<seastar::http::reply> rep) override 
-        {
-            // =========================================================
-            // 【终极修复】Seastar 普通 POST 请求的 Body 存在 req->content 中
-            // =========================================================
-            // 1. 将 seastar::sstring 安全转换为 std::string_view
-            std::string_view body_view(req->content.data(), req->content.size());
-            
-            // 2. 转换为标准 std::string 传给 dispatcher
-            std::string body(body_view);
-
-            // 【可选】打印出来看看，方便确认客户端发了什么
-            //std::cout << "[HTTP Debug] Received body: " << body << std::endl;
-
-            // =========================================================
-            // 3. 交给 Dispatcher 处理
-            // =========================================================
-            auto response_opt = co_await _dispatcher.handle_request(body);
-
-            // 4. 返回 HTTP 响应
-            if (response_opt) {
-                rep->write_body("json", *response_opt);
-            } else {
-                // 这个分支是处理 Notification (没有 id 的请求，不需要返回 JSON)
-                rep->set_status(seastar::http::reply::status_type::accepted);
-            }
-
-            co_return std::move(rep);
-        }
+    struct SseSession {
+        seastar::queue<std::string> messages{100};
+        bool active = true;
     };
 
     class McpServer {
+        seastar::httpd::http_server _server;
+        mcp::router::JsonRpcDispatcher _dispatcher;
+        std::unordered_map<std::string, std::shared_ptr<SseSession>> _sessions;
+        uint64_t _session_counter = 0;
+
     public:
-        // 改回带名字的单核 http_server
         McpServer() : _server("mcp_server") {}
+        mcp::router::JsonRpcDispatcher& dispatcher() { return _dispatcher; }
 
         seastar::future<> start(uint16_t port) {
-            // 直接将路由挂载到当前核心的 server 上
             set_routes(_server._routes);
-            // 启动监听
             return _server.listen(seastar::socket_address{seastar::ipv4_addr{port}});
         }
-
-        seastar::future<> stop() {
-            return _server.stop();
-        }
-
-        mcp::router::JsonRpcDispatcher& dispatcher() { return _dispatcher; }
+        seastar::future<> stop() { return _server.stop(); }
 
     private:
         void set_routes(seastar::httpd::routes& r) {
-            r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/message"), new McpHandler(_dispatcher));
+            // 修复点 1: function_handler 需要第二个参数指定默认 content-type
+            r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/sse"), 
+                new seastar::httpd::function_handler([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
+                    return handle_sse(std::move(req), std::move(rep));
+                }, "txt")); 
+            
+            r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/message"), 
+                new seastar::httpd::function_handler([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
+                    return handle_message(std::move(req), std::move(rep));
+                }, "json"));
         }
 
-        // 关键点：去掉了 _control，变成普通的 http_server
-        seastar::httpd::http_server _server;
-        mcp::router::JsonRpcDispatcher _dispatcher;
-    };
+        seastar::future<std::unique_ptr<seastar::http::reply>> handle_sse(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
+            std::string session_id = "sess_" + std::to_string(++_session_counter);
+            auto session = std::make_shared<SseSession>();
+            _sessions[session_id] = session;
 
+            rep->set_content_type("text/event-stream");
+            rep->add_header("Cache-Control", "no-cache");
+            rep->add_header("Connection", "keep-alive");
+
+            rep->write_body("text/event-stream", [session_id, session](seastar::output_stream<char>&& out) mutable -> seastar::future<> {
+                try {
+                    co_await out.write("event: endpoint\ndata: /message?sessionId=" + session_id + "\n\n");
+                    co_await out.flush();
+                    while (session->active) {
+                        auto msg = co_await session->messages.pop_eventually();
+                        if (msg.empty() || !session->active) break;
+                        co_await out.write("data: " + msg + "\n\n");
+                        co_await out.flush();
+                    }
+                } catch (...) { session->active = false; }
+                co_await out.close();
+            });
+            co_return std::move(rep);
+        }
+
+        seastar::future<std::unique_ptr<seastar::http::reply>> handle_message(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
+            std::string_view body_view(req->content.data(), req->content.size());
+            std::string session_id = req->get_query_param("sessionId");
+            
+            auto response_opt = co_await _dispatcher.handle_request(std::string(body_view));
+
+            if (!session_id.empty() && _sessions.contains(session_id)) {
+                if (response_opt) {
+                    // 修复点 2: 显式 std::move 满足右值引用要求
+                    (void)_sessions[session_id]->messages.push_eventually(std::move(*response_opt));
+                }
+                rep->set_status(seastar::http::reply::status_type::accepted);
+            } else {
+                if (response_opt) rep->write_body("json", *response_opt);
+                else rep->set_status(seastar::http::reply::status_type::accepted);
+            }
+            co_return std::move(rep);
+        }
+    };
 }
