@@ -70,14 +70,19 @@ namespace mcp::server {
         }
 
         seastar::future<std::unique_ptr<seastar::http::reply>> handle_message(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-            std::string_view body_view(req->content.data(), req->content.size());
+            
+// 👇 开启编译器魔法：忽略废弃警告 (对 GCC 和 Clang 均有效)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            // 底层已经将流读取完毕，数据一定在 content 中，直接取用
+            std::string body(req->content.data(), req->content.size());
+#pragma GCC diagnostic pop
+// 👆 恢复编译器警告设置
             std::string session_id = req->get_query_param("sessionId");
             
-            auto response_opt = co_await _dispatcher.handle_request(std::string(body_view));
-
+            auto response_opt = co_await _dispatcher.handle_request(body);
             if (!session_id.empty() && _sessions.contains(session_id)) {
                 if (response_opt) {
-                    // 修复点 2: 显式 std::move 满足右值引用要求
                     (void)_sessions[session_id]->messages.push_eventually(std::move(*response_opt));
                 }
                 rep->set_status(seastar::http::reply::status_type::accepted);
