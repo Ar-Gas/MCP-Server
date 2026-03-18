@@ -1,201 +1,156 @@
 # 🚀 Seastar MCP Server
 
-基于 **C++20** 和 **Seastar 异步框架** 构建的高性能 **MCP (Model Context Protocol) 服务器**。
+基于 **C++20** 和 **Seastar 异步框架** 构建的高性能、全功能 **MCP (Model Context Protocol) 服务器**。
 
-本项目旨在为大语言模型（如 Claude, Cursor 等）提供标准化的本地/远程工具调用（Tool Calling）能力。结合 Seastar 框架的 Share-Nothing 架构与 C++20 协程，能够以极低的延迟和极高的吞吐量处理 AI 客户端的并发请求。
-
-## ✨ 核心特性
-
-- **⚡ 极致性能**：底层基于 Seastar 异步 I/O 框架，单核性能炸裂。
-- **🧵 现代 C++**：全面拥抱 C++20 协程 (`co_await` / `co_return`)，告别回调地狱。
-- **🔌 灵活的插件系统**：高度解耦的 `ToolManager`，新增 AI 工具只需实现基类并注册，零 `if-else`。
-- **📡 标准协议**：严格遵循 [MCP 规范](https://modelcontextprotocol.io/) 与 JSON-RPC 2.0 协议。
+本项目不仅将 C++ 的极致性能与大模型工具调用相结合，还完整实现了 MCP 规范的核心特性。得益于 Seastar 的 Share-Nothing 架构与底层的 StdIO 桥接技术，它既能作为高并发的 HTTP/SSE 微服务运行，也能作为轻量级的本地 StdIO 插件直接接入各种 AI 客户端。
 
 ---
 
-## 性能测试
+## ✨ 核心特性
 
-在2核4G的ubuntu24.04虚拟机上（与windows主机压测程序桥接）测试加法器
+- **⚡ 极致性能**：基于 Seastar 异步 I/O 框架，单核支撑海量并发。在 2核4G 虚拟机上实测单节点稳定并发 1500，峰值 QPS 破万，P95 延迟低于 85ms。
+- **🧵 现代 C++**：全面拥抱 C++20 协程 (`co_await` / `co_return`)，告别回调地狱，代码如丝般顺滑。
+- **📦 全面支持 MCP 规范**：
+  - 🛠️ **Tools (工具)**：提供计算、系统时间等动作执行。
+  - 📊 **Resources (资源)**：支持静态资源读取（如内存状态）和动态资源模板（URI Templates）。
+  - 📝 **Prompts (提示词)**：支持向 AI 下发带有上下文的系统提示词模板。
+  - 💡 **Auto-Completion (自动补全)**：支持客户端参数联想提示。
+- **🔌 双模通信 (Dual Transport)**：
+  - **StdIO 模式**：原生兼容 Claude Desktop、Cursor、MCP Inspector 等标准客户端。
+  - **HTTP/SSE 模式**：内置 Web Server 支持基于 TCP 端口的远程调用。
 
-服务端最大稳定并发数为 1500，峰值处理能力超过 10,000 QPS。在极高负载下，服务保持 0 错误率，且 95% 的请求响应时间低于 85 ms。
+---
 
 ## 📂 项目结构
+
+高度解耦的目录设计，新增 AI 能力只需实现对应的基类并注册，零 `if-else`。
 
 ```text
 .
 ├── app
-│   └── main.cc                        # 程序入口：启动 Seastar 引擎，注册路由，处理退出信号
-├── include
-│   └── mcp
-│       ├── handlers
-│       │   └── mcp_handler.hh         # ToolManager 定义与路由注册入口声明
-│       ├── protocol
-│       │   └── json_rpc.hh            # JSON-RPC 2.0 协议的数据结构定义
-│       ├── router
-│       │   └── dispatcher.hh          # 请求分发器：解析 JSON，自动路由 Method/Notification
-│       ├── server
-│       │   └── mcp_server.hh          # 基于 seastar::httpd 的 Web 服务器封装
-│       └── tools
-│           ├── mcp_tool.hh            # 核心接口：McpTool 抽象基类
-│           ├── calculate_sum_tool.hh  # 示例工具 1：加法计算器
-│           └── get_current_time_tool.hh # 示例工具 2：获取系统当前时间
-├── src
-│   └── mcp
-│       └── handlers
-│           └── mcp_handler.cc         # 核心业务逻辑：绑定握手协议、工具列表与调用
-├── third                              # 第三方依赖 (Seastar 源码等)
-└── CMakeLists.txt                     # CMake 构建配置文件
+│   └── main.cc                        # 引擎入口与 StdIO-HTTP 桥接器
+├── include/mcp
+│   ├── handlers/mcp_handler.hh        # 统一资源注册表与路由核心
+│   ├── interfaces.hh                  # McpTool, McpResource, McpPrompt 抽象基类
+│   ├── prompts/analyze_system_prompt.hh # 示例：性能分析提示词
+│   ├── protocol/json_rpc.hh           # JSON-RPC 2.0 协议支持
+│   ├── resources/system_info_resource.hh# 示例：系统内存资源状态读取
+│   ├── router/dispatcher.hh           # 异步 RPC 路由器
+│   ├── server/mcp_server.hh           # HTTP POST & SSE 核心服务器
+│   └── tools/                         # 示例：加法器与时间获取工具
+├── src/mcp/handlers/mcp_handler.cc    # 路由绑定与业务分发逻辑
+├── Dockerfile                         # 面向生产环境的极简镜像构建配置
+└── CMakeLists.txt                     # CMake 构建文件 (自动拉取 nlohmann/json)
 ```
 
 ---
 
-## 🛠️ 环境与依赖
+## 🛠️ 编译与构建
 
-在编译本项目之前，请确保您的系统满足以下条件：
+系统要求：Linux (Ubuntu 24.04 推荐) 或 WSL2，支持 C++20 的编译器 (GCC 10+ / Clang 10+)，CMake 3.15+。
 
-1. **操作系统**：Linux (Ubuntu 20.04/22.04 推荐) 或 WSL2。
-2. **编译器**：支持 C++20 的 GCC (>= 10.0) 或 Clang (>= 10.0)。
-3. **构建工具**：CMake (>= 3.15) 和 Make / Ninja。
-4. **Seastar 框架**：依赖 `third` 目录下的 Seastar 源码，或已在系统中全局安装 Seastar 开发库。
-5. **nlohmann/json**：用于 JSON 解析（CMake 会自动拉取，无需手动安装）。
-
----
-
-## 🚀 编译与运行
-
-**1. 创建构建目录并编译**
-
+**1. 本地直接编译**
 ```bash
-mkdir build
-cd build
-# 配置 CMake 
-cmake .. -G Ninja   # 如果没有安装 Ninja，直接运行 cmake .. 即可
-# 编译项目
-ninja               # 或使用 make -j$(nproc)
+mkdir build && cd build
+cmake .. -G Ninja
+ninja
 ```
 
-**2. 启动 MCP 服务器**
-
-由于底层是 Seastar 框架，推荐指定 `-c` 参数来分配 CPU 核心数：
-
+**2. 使用 Docker 容器化构建（推荐）**
 ```bash
-# 以 1 个 CPU 核心启动服务器
-./mcp_server -c1
-```
+# 构建镜像 (体积小，包含最小化运行时依赖)
+docker build -t seastar-mcp-server:v1 .
 
-看到输出 `MCP Server is running on port 8080.` 即表示启动成功！使用 `Ctrl+C` 可以优雅停机。
-
----
-
-## 🎮 使用与测试指南
-
-服务器运行在 `http://127.0.0.1:8080/message`，接受标准 JSON-RPC 2.0 POST 请求。请打开**另一个终端窗口**，使用 `curl` 模拟 AI 客户端进行测试。
-
-### 1. 🤝 协议握手 (Initialize)
-
-客户端连接时的第一步，验证协议版本并获取服务器能力（Capabilities）。
-
-```bash
-curl -X POST http://127.0.0.1:8080/message \
-     -H "Content-Type: application/json" \
-     -d '{
-           "jsonrpc": "2.0",
-           "id": 1,
-           "method": "initialize",
-           "params": {
-               "protocolVersion": "2024-11-05",
-               "capabilities": {},
-               "clientInfo": {"name": "TestClient", "version": "1.0.0"}
-           }
-         }' | jq
-```
-
-### 2. 📋 获取工具列表 (tools/list)
-
-大模型会请求此接口，了解当前服务器提供了哪些能力。
-
-```bash
-curl -X POST http://127.0.0.1:8080/message \
-     -H "Content-Type: application/json" \
-     -d '{
-           "jsonrpc": "2.0",
-           "id": 2,
-           "method": "tools/list",
-           "params": {}
-         }' | jq
-```
-
-### 3. 🛠️ 调用工具 (tools/call)
-
-**示例 A：调用系统时间工具 (`get_current_time`)**
-
-```bash
-curl -X POST http://127.0.0.1:8080/message \
-     -H "Content-Type: application/json" \
-     -d '{
-           "jsonrpc": "2.0",
-           "id": 3,
-           "method": "tools/call",
-           "params": {
-               "name": "get_current_time",
-               "arguments": {}
-           }
-         }' | jq
-```
-
-**示例 B：调用加法计算器 (`calculate_sum`)**
-
-```bash
-curl -X POST http://127.0.0.1:8080/message \
-     -H "Content-Type: application/json" \
-     -d '{
-           "jsonrpc": "2.0",
-           "id": 4,
-           "method": "tools/call",
-           "params": {
-               "name": "calculate_sum",
-               "arguments": {
-                   "a": 15.5,
-                   "b": 24.5
-               }
-           }
-         }' | jq
+# 打包为离线压缩包 (可选)
+docker save seastar-mcp-server:v1 | gzip > my-seastar-mcp.tar.gz
 ```
 
 ---
 
-## 🧩 如何开发新工具？
+## 🎮 调试与运行
 
-得益于高度解耦的架构设计，为您的大模型添加新能力极其简单，仅需两步：
+### 方法一：使用 MCP 官方 Inspector（强烈推荐）
 
-**步骤 1：新建一个工具类继承 `McpTool`**
-实现三个纯虚函数：`get_name()`, `get_definition()`, `execute()`。
-（参考 `include/mcp/tools/calculate_sum_tool.hh`）
+官方提供的 Inspector 是最好的调试可视化工具，它可以通过 StdIO 直接启动你的 C++ 服务器。
+在项目根目录（确保 build 目录下已生成 `mcp_server`）运行：
 
-**步骤 2：在 `mcp_handler.cc` 中注册它**
-```cpp
-// 引入你的头文件
-#include "mcp/tools/my_awesome_tool.hh"
-
-// 在 McpHandler::register_routes 中注册：
-tool_manager->register_tool(std::make_shared<mcp::tools::MyAwesomeTool>());
+```bash
+npx @modelcontextprotocol/inspector ./build/mcp_server
 ```
-重新编译运行，系统会自动将其暴露给所有的 AI 客户端，无需改动任何网络路由代码！
+运行后浏览器将自动打开本地网页，你可以通过图形化界面点击测试所有的 Tools、Resources 和 Prompts，并实时查看 JSON-RPC 交互日志！
 
-##  claude desktop 配置
+### 方法二：作为独立微服务运行 (HTTP/SSE)
 
-``` json
+通过指定 Seastar 参数启动（限制 1 个 CPU 核心与 512MB 内存）：
+```bash
+./build/mcp_server -c 1 -m 512M --default-log-level=warn
+```
+启动后，服务器会在 `127.0.0.1:8080` 监听。你可以使用 `curl` 进行测试：
+
+<details>
+<summary>展开查看 Curl 测试命令</summary>
+
+**获取服务器提供的工具列表**
+```bash
+curl -X POST http://127.0.0.1:8080/message \
+     -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}'
+```
+
+**读取系统状态资源 (Resources)**
+```bash
+curl -X POST http://127.0.0.1:8080/message \
+     -d '{"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "sys://memory-info"}}'
+```
+
+**请求提示词模板 (Prompts)**
+```bash
+curl -X POST http://127.0.0.1:8080/message \
+     -d '{"jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": {"name": "analyze_server_health", "arguments": {"focus": "memory"}}}'
+```
+</details>
+
+---
+
+## 🤖 接入 AI 客户端 (Claude Desktop)
+
+本项目完美支持作为本地工具链接入大模型客户端。你可以修改 Claude Desktop 的配置文件（通常在 `~/.claude/claude_desktop_config.json` 或 Windows 的 `%APPDATA%\Claude\claude_desktop_config.json`）。
+
+### 方式 A：通过本地二进制直连
+```json
 {
   "mcpServers": {
-    "seastar_cpp_tools": {
+    "seastar_cpp_server": {
+      "command": "/绝对路径/到你的/项目/build/mcp_server",
+      "args": ["-c", "1", "-m", "512M", "--default-log-level=warn"]
+    }
+  }
+}
+```
+
+### 方式 B：通过 Docker 运行（沙盒隔离更安全）
+如果你打包了 Docker 镜像，可以通过下面的方式接入：
+```json
+{
+  "mcpServers": {
+    "seastar_docker_tools": {
       "command": "docker",
       "args": [
         "run",
-        "-i",
-        "--rm",
-        "my-seastar-mcp:v1"
+        "-i",         
+        "--rm",       
+        "seastar-mcp-server:v1"
       ]
     }
   }
 }
 ```
+*(注意：`docker run` 必须包含 `-i` 才能保持 StdIO 输入流的开启。)*
+
+---
+
+## 🧩 如何扩展你的业务？
+
+为你的服务器添加新能力非常简单：
+1. **继承基类**：在 `include/mcp/tools/` 或 `resources/` 下新建头文件，继承 `McpTool` 或 `McpResource` 等基类并实现虚函数。
+2. **注册路由**：在 `src/mcp/handlers/mcp_handler.cc` 中的 `register_routes` 方法里，调用 `registry->register_xxx(...)`。
+3. **编译生效**：无需修改任何网络底层代码，新功能即刻上线！
