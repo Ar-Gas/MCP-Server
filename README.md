@@ -8,7 +8,7 @@
 
 ## 核心特性
 
-- **极致性能**：基于 Seastar 异步 I/O 框架，Share-Nothing 架构，真正多核并行。在 2核4G 虚拟机上实测单核 QPS 超过 500，P95 延迟低于 100ms，零错误率。
+- **极致性能**：基于 Seastar 异步 I/O 框架，Share-Nothing 架构，真正多核并行。
 - **现代 C++**：全面拥抱 C++20 协程（`co_await` / `co_return`），SDK 接口简洁，无回调地狱。
 - **完整 MCP 协议支持**（`2025-11-25`）：
   - **Tools**：工具调用，`isError` 字段自动处理，支持 cursor 分页，支持 outputSchema 和 annotations。
