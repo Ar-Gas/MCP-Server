@@ -2,6 +2,7 @@
 #include "mcp/transport/transport.hh"
 #include "mcp/server/mcp_shard.hh"
 #include "mcp/server/mcp_server.hh"
+#include "mcp/security/security_policy.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
@@ -38,7 +39,7 @@ inline seastar::logger streamable_http_log("streamable_http_transport");
 // DELETE /mcp（有 Mcp-Session-Id）：
 //   - 关闭并清理 session，响应 200
 //
-// Session ID 格式：sm{shard_id}_{counter}（区别于 SSE transport 的 s{N}_{counter}）
+// 安全防护：与 HttpSseTransport 相同的 P0/P1/P2 检查体系
 class StreamableHttpTransport : public ITransport {
     uint16_t _port;
     seastar::httpd::http_server_control _server;
@@ -61,12 +62,6 @@ public:
 
 private:
     // ── Custom handler: preserves Content-Type set by _handle_post ──────────
-    //
-    // seastar::httpd::function_handler always calls rep->done(_type) after the
-    // user function returns, unconditionally overwriting the Content-Type header.
-    // For POST /mcp we serve both application/json and text/event-stream
-    // depending on the Accept header, so we need to preserve what _handle_post set.
-    // This handler calls done() (no-arg, only sets _response_line) instead.
     struct _PostMcpHandler : seastar::httpd::handler_base {
         seastar::sharded<mcp::server::McpShard>& _shards;
         explicit _PostMcpHandler(seastar::sharded<mcp::server::McpShard>& s) : _shards(s) {}
@@ -76,7 +71,7 @@ private:
             std::unique_ptr<seastar::http::reply> rep) override {
             return _handle_post(_shards, std::move(req), std::move(rep))
                 .then([](std::unique_ptr<seastar::http::reply> r) {
-                    r->done();  // sets _response_line only, does NOT override Content-Type
+                    r->done();
                     return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(
                         std::move(r));
                 });
@@ -105,16 +100,97 @@ private:
                 }, "json"));
     }
 
+    // ── 安全辅助方法（与 HttpSseTransport 一致）──────────────────────────────
+
+    static std::string _get_client_ip(const seastar::http::request& req) {
+        auto real_ip = req.get_header("x-real-ip");
+        if (!real_ip.empty()) return std::string(real_ip);
+
+        auto forwarded = req.get_header("x-forwarded-for");
+        if (!forwarded.empty()) {
+            std::string fwd = forwarded;
+            auto pos = fwd.find(',');
+            auto ip = (pos != std::string::npos) ? fwd.substr(0, pos) : fwd;
+            while (!ip.empty() && ip.front() == ' ') ip.erase(ip.begin());
+            while (!ip.empty() && ip.back()  == ' ') ip.pop_back();
+            return ip;
+        }
+        return "";
+    }
+
+    static std::string _get_api_key(const seastar::http::request& req) {
+        auto key = req.get_header("x-api-key");
+        if (!key.empty()) return std::string(key);
+
+        auto auth = req.get_header("authorization");
+        if (auth.size() > 7 && auth.substr(0, 7) == "Bearer ") {
+            return std::string(auth.substr(7));
+        }
+        return "";
+    }
+
+    static seastar::future<std::unique_ptr<seastar::http::reply>>
+    _security_reject(std::unique_ptr<seastar::http::reply> rep,
+                     mcp::security::SecurityCheckResult result) {
+        using R = mcp::security::SecurityCheckResult;
+        using S = seastar::http::reply::status_type;
+
+        switch (result) {
+        case R::FORBIDDEN:
+            rep->set_status(S::forbidden);
+            rep->write_body("json", R"({"error":"Forbidden","code":403})");
+            break;
+        case R::UNAUTHORIZED:
+            rep->set_status(S::unauthorized);
+            rep->add_header("WWW-Authenticate", "Bearer");
+            rep->write_body("json", R"({"error":"Unauthorized","code":401})");
+            break;
+        case R::TOO_MANY_REQUESTS:
+            rep->set_status(static_cast<S>(429));
+            rep->add_header("Retry-After", "1");
+            rep->write_body("json", R"({"error":"Too Many Requests","code":429})");
+            break;
+        case R::SERVICE_UNAVAILABLE:
+        case R::CONNECTION_LIMIT:
+            rep->set_status(S::service_unavailable);
+            rep->write_body("json", R"({"error":"Service Unavailable","code":503})");
+            break;
+        case R::PAYLOAD_TOO_LARGE:
+            rep->set_status(static_cast<S>(413));
+            rep->write_body("json", R"({"error":"Payload Too Large","code":413})");
+            break;
+        default:
+            break;
+        }
+        co_return std::move(rep);
+    }
+
     // ── POST /mcp ────────────────────────────────────────────────────────────
 
     static seastar::future<std::unique_ptr<seastar::http::reply>>
     _handle_post(seastar::sharded<mcp::server::McpShard>& shards,
                  std::unique_ptr<seastar::http::request> req,
                  std::unique_ptr<seastar::http::reply> rep) {
+        std::string client_ip = _get_client_ip(*req);
+        std::string api_key   = _get_api_key(*req);
+
+        // P0: 请求体大小检查
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         std::string body(req->content.data(), req->content.size());
 #pragma GCC diagnostic pop
+
+        if (!shards.local().check_body_size(body.size())) {
+            co_return co_await _security_reject(std::move(rep),
+                mcp::security::SecurityCheckResult::PAYLOAD_TOO_LARGE);
+        }
+
+        // P0/P1/P2 安全检查
+        auto check = shards.local().check_request(client_ip, api_key);
+        if (check != mcp::security::SecurityCheckResult::OK) {
+            co_return co_await _security_reject(std::move(rep), check);
+        }
+
         std::string session_id = req->get_header("mcp-session-id");
         std::string accept     = req->get_header("accept");
         bool wants_sse = (accept.find("text/event-stream") != std::string::npos);
@@ -122,6 +198,10 @@ private:
         if (session_id.empty() && !wants_sse) {
             // ── 无会话，简单请求/响应模式 ────────────────────────────────
             auto response_opt = co_await shards.local().dispatch(body, "");
+            bool is_error = response_opt &&
+                response_opt->find("\"error\"") != std::string::npos;
+            shards.local().record_outcome(client_ip, is_error);
+
             if (response_opt) {
                 rep->write_body("json", *response_opt);
             } else {
@@ -131,19 +211,25 @@ private:
         }
 
         if (session_id.empty() && wants_sse) {
-            // ── 新建 SSE session（携带 Accept: text/event-stream）────────
+            // ── 新建 SSE session（P1: 连接数限制）────────────────────────
             session_id = "sm" + std::to_string(seastar::this_shard_id())
                        + "_" + std::to_string(_next_counter());
-            shards.local().create_session_with_id(session_id);
+            shards.local().create_session_with_id(session_id, client_ip);
             auto session = shards.local().get_session(session_id);
+            if (!session) {
+                co_return co_await _security_reject(std::move(rep),
+                    mcp::security::SecurityCheckResult::CONNECTION_LIMIT);
+            }
 
             rep->add_header("mcp-session-id", session_id);
             rep->set_content_type("text/event-stream");
             rep->add_header("Cache-Control", "no-cache");
             rep->add_header("Connection", "keep-alive");
 
-            // 先 dispatch 当前请求，结果作为第一条 SSE event 发送
             auto first_resp = co_await shards.local().dispatch(body, session_id);
+            bool is_error = first_resp &&
+                first_resp->find("\"error\"") != std::string::npos;
+            shards.local().record_outcome(client_ip, is_error);
             if (first_resp) {
                 (void)session->messages.push_eventually(std::move(*first_resp));
             }
@@ -172,6 +258,10 @@ private:
 
         // ── 已有 session：dispatch 并 push ───────────────────────────────
         auto response_opt = co_await shards.local().dispatch(body, session_id);
+        bool is_error = response_opt &&
+            response_opt->find("\"error\"") != std::string::npos;
+        shards.local().record_outcome(client_ip, is_error);
+
         if (response_opt) {
             unsigned target = _parse_shard(session_id);
             if (target == seastar::this_shard_id()) {
@@ -195,6 +285,15 @@ private:
     _handle_get(seastar::sharded<mcp::server::McpShard>& shards,
                 std::unique_ptr<seastar::http::request> req,
                 std::unique_ptr<seastar::http::reply> rep) {
+        std::string client_ip = _get_client_ip(*req);
+        std::string api_key   = _get_api_key(*req);
+
+        // P0/P1/P2 安全检查（GET 不读 body，跳过 body size 检查）
+        auto check = shards.local().check_request(client_ip, api_key);
+        if (check != mcp::security::SecurityCheckResult::OK) {
+            co_return co_await _security_reject(std::move(rep), check);
+        }
+
         std::string session_id = req->get_header("mcp-session-id");
         if (session_id.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
@@ -202,8 +301,6 @@ private:
             co_return std::move(rep);
         }
 
-        // 找到 session 所属核，但 SSE 流必须在本核处理
-        // 如果 session 归属其他核，客户端应重连到对应核（暂返回404）
         auto session = shards.local().get_session(session_id);
         if (!session) {
             rep->set_status(seastar::http::reply::status_type::not_found);
@@ -243,6 +340,7 @@ private:
     _handle_delete(seastar::sharded<mcp::server::McpShard>& shards,
                    std::unique_ptr<seastar::http::request> req,
                    std::unique_ptr<seastar::http::reply> rep) {
+        // DELETE 不需要安全检查（已有 session 的持有者才能删除）
         std::string session_id = req->get_header("mcp-session-id");
         if (!session_id.empty()) {
             unsigned target = _parse_shard(session_id);
@@ -273,7 +371,6 @@ private:
 
     // 从 session ID 解析 shard："sm{N}_{counter}" → N
     static unsigned _parse_shard(const std::string& id) {
-        // 支持 "sm{N}_..." 和 "s{N}_..."（兼容 SSE transport 格式）
         std::size_t start = (id.size() > 2 && id[0] == 's' && id[1] == 'm') ? 2 : 1;
         auto pos = id.find('_', start);
         if (pos != std::string::npos && pos > start) {
@@ -283,7 +380,6 @@ private:
         return 0;
     }
 
-    // 原子计数器（每核独立，配合 shard ID 保证全局唯一）
     static uint64_t _next_counter() {
         static thread_local uint64_t counter = 0;
         return ++counter;

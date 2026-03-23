@@ -2,6 +2,7 @@
 #include "mcp/transport/transport.hh"
 #include "mcp/server/mcp_shard.hh"
 #include "mcp/server/mcp_server.hh"
+#include "mcp/security/security_policy.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
@@ -26,6 +27,14 @@ inline seastar::logger http_sse_log("http_sse_transport");
 //   - POST /message 解析 sessionId 中的 shard ID
 //       同核：直接 push
 //       跨核：invoke_on(target) + run_in_background
+//
+// 安全防护（在每个请求最前端执行）：
+//   P0: 请求体大小限制（max_body_bytes）
+//   P0: IP 黑名单/白名单过滤
+//   P0: Per-IP 速率限制（令牌桶）
+//   P0: Per-IP 熔断器（CLOSED/OPEN/HALF_OPEN）
+//   P1: SSE 连接数限制（max_per_ip / max_total）
+//   P2: API Key 认证（disabled by default）
 class HttpSseTransport : public ITransport {
     uint16_t _port;
     seastar::httpd::http_server_control _server;
@@ -35,7 +44,6 @@ public:
 
     seastar::future<> start(mcp::server::McpServer& server) override {
         co_await _server.start("mcp_http_sse");
-        // set_routes 的 lambda 在每个 shard 上执行一次，各 shard 独立设置路由
         co_await _server.set_routes([&shards = server.shards()](seastar::httpd::routes& r) {
             _setup_routes(r, shards);
         });
@@ -67,14 +75,100 @@ private:
                 }, "json"));
     }
 
+    // ── 安全辅助方法 ──────────────────────────────────────────────────────────
+
+    // 从请求中提取客户端 IP
+    // 优先读 X-Real-IP（反向代理设置），其次 X-Forwarded-For 的第一个 IP，
+    // 最后返回空串（由 IpFilter::is_allowed 按 default_allow 策略处理）
+    static std::string _get_client_ip(const seastar::http::request& req) {
+        auto real_ip = req.get_header("x-real-ip");
+        if (!real_ip.empty()) return std::string(real_ip);
+
+        auto forwarded = req.get_header("x-forwarded-for");
+        if (!forwarded.empty()) {
+            std::string fwd = forwarded;
+            auto pos = fwd.find(',');
+            auto ip = (pos != std::string::npos) ? fwd.substr(0, pos) : fwd;
+            // 去除前后空格
+            while (!ip.empty() && ip.front() == ' ') ip.erase(ip.begin());
+            while (!ip.empty() && ip.back()  == ' ') ip.pop_back();
+            return ip;
+        }
+        return "";  // 直连但无法获取 IP（由 default_allow 决定）
+    }
+
+    // 从请求 header 中提取 API Key（P2）
+    // 支持 "X-API-Key: <key>" 或 "Authorization: Bearer <token>"
+    static std::string _get_api_key(const seastar::http::request& req) {
+        auto key = req.get_header("x-api-key");
+        if (!key.empty()) return std::string(key);
+
+        auto auth = req.get_header("authorization");
+        if (auth.size() > 7 && auth.substr(0, 7) == "Bearer ") {
+            return std::string(auth.substr(7));
+        }
+        return "";
+    }
+
+    // 将 SecurityCheckResult 转换为 HTTP 错误响应
+    static seastar::future<std::unique_ptr<seastar::http::reply>>
+    _security_reject(std::unique_ptr<seastar::http::reply> rep,
+                     mcp::security::SecurityCheckResult result) {
+        using R = mcp::security::SecurityCheckResult;
+        using S = seastar::http::reply::status_type;
+
+        switch (result) {
+        case R::FORBIDDEN:
+            rep->set_status(S::forbidden);
+            rep->write_body("json", R"({"error":"Forbidden","code":403})");
+            break;
+        case R::UNAUTHORIZED:
+            rep->set_status(S::unauthorized);
+            rep->add_header("WWW-Authenticate", "Bearer");
+            rep->write_body("json", R"({"error":"Unauthorized","code":401})");
+            break;
+        case R::TOO_MANY_REQUESTS:
+            rep->set_status(static_cast<S>(429));
+            rep->add_header("Retry-After", "1");
+            rep->write_body("json", R"({"error":"Too Many Requests","code":429})");
+            break;
+        case R::SERVICE_UNAVAILABLE:
+        case R::CONNECTION_LIMIT:
+            rep->set_status(S::service_unavailable);
+            rep->write_body("json", R"({"error":"Service Unavailable","code":503})");
+            break;
+        case R::PAYLOAD_TOO_LARGE:
+            rep->set_status(static_cast<S>(413));
+            rep->write_body("json", R"({"error":"Payload Too Large","code":413})");
+            break;
+        default:
+            break;
+        }
+        co_return std::move(rep);
+    }
+
     // ── SSE 连接处理 ─────────────────────────────────────────────────────────
 
     static seastar::future<std::unique_ptr<seastar::http::reply>>
     _handle_sse(seastar::sharded<mcp::server::McpShard>& shards,
-                std::unique_ptr<seastar::http::request>,
+                std::unique_ptr<seastar::http::request> req,
                 std::unique_ptr<seastar::http::reply> rep) {
-        // 在本核创建 session
-        std::string session_id = shards.local().create_session();
+        std::string client_ip = _get_client_ip(*req);
+        std::string api_key   = _get_api_key(*req);
+
+        // P0/P1/P2 安全检查（IP 过滤 + 速率限制 + 熔断器 + API Key）
+        auto check = shards.local().check_request(client_ip, api_key);
+        if (check != mcp::security::SecurityCheckResult::OK) {
+            co_return co_await _security_reject(std::move(rep), check);
+        }
+
+        // P1: 连接数限制（create_session 内部检查，返回空串表示拒绝）
+        std::string session_id = shards.local().create_session(client_ip);
+        if (session_id.empty()) {
+            co_return co_await _security_reject(std::move(rep),
+                mcp::security::SecurityCheckResult::CONNECTION_LIMIT);
+        }
+
         auto session = shards.local().get_session(session_id);
 
         rep->set_content_type("text/event-stream");
@@ -97,7 +191,6 @@ private:
                 } catch (...) {
                     session->active = false;
                 }
-                // 断连后清理本核 session 及其订阅
                 shards.local().cleanup_subscriptions(session_id);
                 shards.local().remove_session(session_id);
                 http_sse_log.debug("SSE session {} closed", session_id);
@@ -113,30 +206,47 @@ private:
     _handle_message(seastar::sharded<mcp::server::McpShard>& shards,
                     std::unique_ptr<seastar::http::request> req,
                     std::unique_ptr<seastar::http::reply> rep) {
+        std::string client_ip = _get_client_ip(*req);
+        std::string api_key   = _get_api_key(*req);
+
+        // P0: 请求体大小检查（最先执行，防止大包消耗内存）
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         std::string body(req->content.data(), req->content.size());
 #pragma GCC diagnostic pop
+
+        if (!shards.local().check_body_size(body.size())) {
+            co_return co_await _security_reject(std::move(rep),
+                mcp::security::SecurityCheckResult::PAYLOAD_TOO_LARGE);
+        }
+
+        // P0/P1/P2 安全检查
+        auto check = shards.local().check_request(client_ip, api_key);
+        if (check != mcp::security::SecurityCheckResult::OK) {
+            co_return co_await _security_reject(std::move(rep), check);
+        }
+
         std::string session_id = req->get_query_param("sessionId");
 
-        // 在本核 dispatch JSON-RPC（传入 session_id 供 subscribe 等 handler 使用）
+        // dispatch JSON-RPC（传入 session_id 供 subscribe 等 handler 使用）
         auto response_opt = co_await shards.local().dispatch(body, session_id);
 
+        // 更新熔断器状态
+        bool is_error = response_opt &&
+            response_opt->find("\"error\"") != std::string::npos;
+        shards.local().record_outcome(client_ip, is_error);
+
         if (session_id.empty()) {
-            // 无 session：直接响应
             if (response_opt) rep->write_body("json", *response_opt);
             else rep->set_status(seastar::http::reply::status_type::accepted);
             co_return std::move(rep);
         }
 
-        // 有 session：将结果 push 到 session 所属核
         if (response_opt) {
             unsigned target = _parse_shard(session_id);
             if (target == seastar::this_shard_id()) {
-                // 同核，直接 push
                 (void)shards.local().push_to_session(session_id, std::move(*response_opt));
             } else {
-                // 跨核：通过 invoke_on 在目标核上 push
                 auto msg = std::move(*response_opt);
                 seastar::engine().run_in_background(
                     shards.invoke_on(target,

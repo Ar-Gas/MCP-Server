@@ -19,7 +19,8 @@
   │HttpSseTrans │   │StreamableHttp  │   │  StdioTransport │
   │  port :8080 │   │Transport :8081 │   │  (shard 0 only) │
   └──────┬──────┘   └────────┬───────┘   └─────────┬───────┘
-         │                   │                      │
+         │    ↑ 安全层        │    ↑ 安全层           │
+         │  IP过滤/限流/熔断  │  IP过滤/限流/熔断     │（无 HTTP 安全层）
          └───────────────────┴──────────────────────┘
                              │ dispatch(body, session_id)
          ┌───────────────────┼──────────────────────────────┐
@@ -32,6 +33,9 @@
   │ Registry    │   │  Registry     │            │   Registry      │
   │ Sessions    │   │  Sessions     │            │   Sessions      │
   │ Subscript.  │   │  Subscript.   │            │   Subscript.    │
+  │ IpFilter    │   │  IpFilter     │            │   IpFilter      │
+  │ RateLimiter │   │  RateLimiter  │            │   RateLimiter   │
+  │ CircuitBkr  │   │  CircuitBkr   │            │   CircuitBkr    │
   └─────────────┘   └───────────────┘            └─────────────────┘
 ```
 
@@ -63,6 +67,11 @@ Seastar `peering_sharded_service<McpShard>`，每个核心独立持有：
 | `_subscriptions` | `unordered_map<uri, set<session_id>>` | 资源订阅表 |
 | `_pending_client_requests` | `unordered_map<id, promise<json>>` | 双向 RPC 等待表 |
 | `_current_session_id` | `string` | 当前正在处理的请求所属 session |
+| `_ip_filter` | `IpFilter` | IP 白名单/黑名单（每核独立实例） |
+| `_rate_limiter` | `PerIpRateLimiter` | Per-IP 令牌桶限流（每核独立） |
+| `_circuit_breaker` | `PerIpCircuitBreaker` | Per-IP 熔断器（每核独立） |
+| `_session_to_ip` | `unordered_map<session_id, ip>` | 追踪 session 归属 IP（连接数限制） |
+| `_ip_conn_count` | `unordered_map<ip, size_t>` | Per-IP 并发连接数计数 |
 
 ### 2.3 McpRegistry（注册表，共享只读）
 
@@ -264,3 +273,89 @@ _body_writer(http::internal::make_http_chunked_output_stream(out)).then([&out] {
 Seastar 的 `function_handler::handle()` 在用户函数返回后调用 `rep->done(_type)`，无条件覆盖 Content-Type。对于 POST /mcp 这种动态返回 JSON 或 SSE 的端点，需要绕过这一行为。
 
 修复：使用自定义 `_PostMcpHandler` 继承 `handler_base`，在返回后调用 `rep->done()`（无参数，只设置 response line，不覆盖 Content-Type）。
+
+---
+
+## 7. 安全层架构
+
+### 7.1 请求检查链
+
+每个 HTTP 请求在 transport 层按以下顺序通过安全检查，任意一步失败即短路返回：
+
+```
+Transport 收到请求
+        │
+        ▼
+① body size check          （P0，始终生效）
+        │ 超限 → 413 Payload Too Large
+        ▼
+② IpFilter.is_allowed(ip)  （P0，blacklist/whitelist 非空时生效）
+        │ 拒绝 → 403 Forbidden
+        ▼
+③ ApiKeyConfig check        （P2，enabled=false 时跳过）
+        │ 失败 → 401 Unauthorized
+        ▼
+④ RateLimiter.try_acquire(ip)  （P0，enabled=false 时跳过）
+        │ 令牌耗尽 → 429 Too Many Requests
+        ▼
+⑤ CircuitBreaker.allow(ip)    （P0，enabled=false 时跳过）
+        │ 熔断 → 503 Service Unavailable
+        ▼
+⑥ 连接数检查 create_session(ip)  （P1，enabled=false 时跳过，仅 SSE）
+        │ 超限 → 503 Service Unavailable
+        ▼
+  McpShard::dispatch()
+        │
+        ▼
+  CircuitBreaker::record_success/failure(ip)  （根据 RPC 响应更新状态）
+```
+
+### 7.2 Per-Shard 无锁设计
+
+安全组件（`IpFilter`、`PerIpRateLimiter`、`PerIpCircuitBreaker`）每个 shard 独立持有实例：
+
+- **IpFilter**：构造后只读，shard 间无竞争，无锁。
+- **RateLimiter / CircuitBreaker**：per-shard 独立计数，完全无锁。代价是同一 IP 的请求分散到多个 shard 时，每个 shard 独立计数（实际限流阈值 = 配置值 × shard 数量）。这是 Seastar Share-Nothing 架构下的标准权衡。
+
+### 7.3 熔断器状态机
+
+```
+            连续失败 ≥ failure_threshold
+CLOSED ──────────────────────────────────────► OPEN
+  ▲                                             │
+  │ 连续成功 ≥ success_threshold               │ 等待 timeout_seconds
+  │                                             │
+HALF_OPEN ◄──────────────────────────────────── ┘
+    │  ↑
+    │  │ 探测请求失败 → 重置计时器，回到 OPEN
+    └──┘ 探测请求成功（累计）
+```
+
+| 状态 | 行为 | 退出条件 |
+|------|------|---------|
+| `CLOSED` | 正常放行 | 连续失败 ≥ `failure_threshold` |
+| `OPEN` | 拒绝所有请求（503） | 等待 `timeout_seconds` 秒 |
+| `HALF_OPEN` | 放行 ≤ `half_open_max_reqs` 个探测请求 | 连续成功 ≥ `success_threshold` → CLOSED；任意失败 → OPEN |
+
+### 7.4 IP 地址提取优先级
+
+```
+transport 收到请求
+        │
+        ├─ X-Real-IP header 非空？      → 使用该 IP（反向代理标准）
+        ├─ X-Forwarded-For header 非空？ → 使用第一个 IP（去除后续跳转）
+        └─ 均为空                        → 使用 ""（IpFilter 按 default_allow 处理）
+```
+
+> 直连场景（无代理）下，Seastar HTTP handler 暂不直接暴露客户端 socket 地址。
+> 生产环境建议通过 nginx/envoy 设置 `X-Real-IP` header。
+
+### 7.5 目录结构
+
+```
+include/mcp/security/
+├── security_policy.hh    # 所有配置 struct（SecurityPolicy）+ SecurityCheckResult enum
+├── ip_filter.hh          # IpFilter：编译 CIDR 为 (network, mask)，inet_pton 解析
+├── rate_limiter.hh       # PerIpRateLimiter：TokenBucket per IP，steady_clock 计时
+└── circuit_breaker.hh    # PerIpCircuitBreaker：CircuitState per IP，三态状态机
+```

@@ -18,6 +18,7 @@ inline seastar::logger rpc_log("rpc_dispatcher");
 class JsonRpcDispatcher {
     std::unordered_map<std::string, MethodHandler>       _methods;
     std::unordered_map<std::string, NotificationHandler> _notifications;
+    size_t _max_batch_size = 20;  // P0: Batch 炸弹防护，由 McpShard::start() 从配置设置
 
 public:
     void register_method(const std::string& method, MethodHandler handler) {
@@ -26,6 +27,8 @@ public:
     void register_notification(const std::string& method, NotificationHandler handler) {
         _notifications[method] = std::move(handler);
     }
+
+    void set_max_batch_size(size_t n) { _max_batch_size = n; }
 
     // 入口：自动处理单请求和 JSON-RPC Batch（数组）
     seastar::future<std::optional<std::string>> handle_request(const std::string& raw_body) {
@@ -46,6 +49,14 @@ public:
                 JsonRpcResponse err{"2.0", nullptr, nullptr,
                     JsonRpcError{static_cast<int>(JsonRpcErrorCode::InvalidRequest),
                                  "Invalid Request: empty batch", nullptr}};
+                co_return json(err).dump();
+            }
+            // P0: Batch 大小限制，防止单请求耗尽 CPU
+            if (req_json.size() > _max_batch_size) {
+                JsonRpcResponse err{"2.0", nullptr, nullptr,
+                    JsonRpcError{static_cast<int>(JsonRpcErrorCode::InvalidRequest),
+                                 "Batch too large: max " + std::to_string(_max_batch_size)
+                                 + " requests per batch", nullptr}};
                 co_return json(err).dump();
             }
             json responses = json::array();

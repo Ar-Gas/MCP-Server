@@ -13,8 +13,9 @@
 | [系统架构](architecture.md) | 模块划分、分片模型、数据流 |
 | [构建与部署](build-deploy.md) | 依赖安装、编译、运行参数 |
 | [Transport 层](transports.md) | HTTP/SSE、Streamable HTTP、StdIO |
+| [安全防护](security.md) | 威胁模型、P0/P1/P2 配置详解、熔断器、IP 过滤 |
 | **API 参考** | |
-| [McpServerBuilder](api/mcp-server-builder.md) | 服务器流式构建 API |
+| [McpServerBuilder](api/mcp-server-builder.md) | 服务器流式构建 API（含安全配置方法） |
 | [McpTool](api/mcp-tool.md) | Tool 接口与实现指南 |
 | [McpResource](api/mcp-resource.md) | Resource 接口与实现指南 |
 | [McpPrompt](api/mcp-prompt.md) | Prompt 接口与实现指南 |
@@ -33,6 +34,7 @@
 - **高并发**：基于 Seastar 的 Share-Nothing 分片架构，每个 CPU 核心独立处理请求，无锁、无共享内存
 - **低延迟**：全程 C++20 协程（`co_await`），无回调，无线程切换
 - **多传输**：同时支持 HTTP/SSE（端口 8080）、Streamable HTTP（端口 8081）、StdIO 三种传输方式
+- **生产安全**：内置分层安全防护——IP 过滤、速率限制、熔断器、连接数限制、API Key 认证，通过 Builder 方法一行开启
 
 ---
 

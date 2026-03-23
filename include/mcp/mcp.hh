@@ -13,3 +13,9 @@
 #include "mcp/transport/http_sse_transport.hh"
 #include "mcp/transport/streamable_http_transport.hh"
 #include "mcp/core/builder.hh"
+
+// Security module（P0/P1 自动生效，P2 通过 Builder 可选启用）
+#include "mcp/security/security_policy.hh"
+#include "mcp/security/ip_filter.hh"
+#include "mcp/security/rate_limiter.hh"
+#include "mcp/security/circuit_breaker.hh"

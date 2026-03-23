@@ -16,6 +16,7 @@
    - 3.5 [服务主类：McpServer](#35-服务主类mcpserver)
    - 3.6 [传输层：Transport](#36-传输层transport)
    - 3.7 [构建器：McpServerBuilder](#37-构建器mcpserverbuilder)
+   - 3.8 [安全层：Security Module](#38-安全层security-module)
 4. [SDK 接口参考](#4-sdk-接口参考)
    - 4.1 [McpTool 接口](#41-mcptool-接口)
    - 4.2 [McpResource 接口](#42-mcpresource-接口)
@@ -342,7 +343,7 @@ handle_request(raw_body)
 
 ```cpp
 class McpShard : public seastar::peering_sharded_service<McpShard> {
-    McpServerConfig  _config;       // 服务器配置（只读）
+    McpServerConfig  _config;       // 服务器配置（含安全策略，只读）
     shared_ptr<McpRegistry> _registry;  // 注册表（共享只读）
 
     JsonRpcDispatcher _dispatcher;  // 本核 RPC 路由器
@@ -361,6 +362,15 @@ class McpShard : public seastar::peering_sharded_service<McpShard> {
     // 双向 RPC：服务端发起请求时等待客户端响应
     uint64_t _server_request_counter = 0;
     unordered_map<uint64_t, promise<json>> _pending_client_requests;
+
+    // 安全组件（每核独立，无跨核竞争）
+    IpFilter           _ip_filter;        // IP 白/黑名单过滤
+    PerIpRateLimiter   _rate_limiter;     // 令牌桶限流
+    PerIpCircuitBreaker _circuit_breaker; // 熔断器状态机
+
+    // 连接数追踪（用于 P1 连接数限制）
+    unordered_map<string, string> _session_to_ip;   // session → ip
+    unordered_map<string, size_t> _ip_conn_count;   // ip → count
 };
 ```
 
@@ -501,16 +511,63 @@ stdin → [seastar::thread 逐行读取] → dispatch() → stdout
 
 ```
 McpServerBuilder{}
-├── .name("my-server")             → _config.name
-├── .version("1.0.0")             → _config.version
-├── .with_http(8080)              → 启用 HTTP/SSE，端口 8080
-├── .with_streamable_http(8081)   → 启用 Streamable HTTP，端口 8081
-├── .with_stdio()                 → 启用 StdIO
-├── .add_tool<CalculateSumTool>() → registry.register_tool(make_shared<T>())
-├── .add_resource<SystemInfoRes>()→ registry.register_resource(...)
-├── .add_prompt<AnalyzePrompt>()  → registry.register_prompt(...)
-└── .build()                      → return make_unique<McpServer>(config, registry)
+├── .name("my-server")               → _config.name
+├── .version("1.0.0")               → _config.version
+├── .with_http(8080)                → 启用 HTTP/SSE，端口 8080
+├── .with_streamable_http(8081)     → 启用 Streamable HTTP，端口 8081
+├── .with_stdio()                   → 启用 StdIO
+├── .add_tool<CalculateSumTool>()   → registry.register_tool(make_shared<T>())
+├── .add_resource<SystemInfoRes>()  → registry.register_resource(...)
+├── .add_prompt<AnalyzePrompt>()    → registry.register_prompt(...)
+│
+├── ── 安全配置（P0/P1，可选启用）──────────────────────────────────
+├── .with_ip_whitelist({...})       → _config.security.ip_filter.whitelist
+├── .with_ip_blacklist({...})       → _config.security.ip_filter.blacklist
+├── .with_rate_limit(rps, burst)    → _config.security.rate_limit（enabled=true）
+├── .with_circuit_breaker(...)      → _config.security.circuit_breaker（enabled=true）
+├── .with_connection_limit(...)     → _config.security.connection_limit（enabled=true）
+├── .with_size_limits(mb, batch)    → _config.security.size_limits
+├── .with_audit_log()               → _config.security.enable_audit_log=true
+│
+├── ── 安全配置（P2，高级可选）────────────────────────────────────────
+├── .with_api_key({...})            → _config.security.api_key（enabled=true）
+├── .with_tls(cert, key, ca)        → _config.security.tls（enabled=true，待实现）
+│
+└── .build()                        → return make_unique<McpServer>(config, registry)
 ```
+
+---
+
+### 3.8 安全层：Security Module
+
+**文件**：`include/mcp/security/`
+
+安全层在 transport 层最前端执行，每个请求进入 `dispatch()` 之前完成所有安全检查。
+
+#### 模块组成
+
+| 文件 | 职责 |
+|------|------|
+| `security_policy.hh` | 所有配置 struct（`SecurityPolicy`）+ `SecurityCheckResult` 枚举 |
+| `ip_filter.hh` | `IpFilter`：编译 CIDR 为 `(network, mask)`，`inet_pton` 解析，黑名单优先 |
+| `rate_limiter.hh` | `PerIpRateLimiter`：令牌桶，`steady_clock` 计时，per-shard 无锁 |
+| `circuit_breaker.hh` | `PerIpCircuitBreaker`：CLOSED/OPEN/HALF_OPEN 三态状态机 |
+
+#### 检查链（执行顺序）
+
+```
+① body size      → 413
+② IP blacklist   → 403
+③ IP whitelist   → 403
+④ API Key (P2)   → 401
+⑤ 速率限制       → 429
+⑥ 熔断器         → 503
+⑦ 连接数 (P1)   → 503
+── dispatch() ──────
+⑧ record_outcome → 更新熔断器
+```
+
+详细设计见 [安全防护文档](../security.md)。
 
 ---
 
@@ -784,6 +841,21 @@ mcp::McpServerBuilder{}
     .add_tool<GetCurrentTimeTool>()
     .add_resource<SystemInfoResource>()
     .add_prompt<AnalyzeSystemPrompt>()
+
+    // ── P0 安全配置（推荐生产环境）──────────────────────────────────
+    .with_ip_whitelist({"10.0.0.0/8"})  // CIDR 白名单（非白即拒）
+    .with_ip_blacklist({"1.2.3.0/24"})  // CIDR 黑名单（优先于白名单）
+    .with_rate_limit(100, 200)          // 每IP 100 req/s，突发 200
+    .with_circuit_breaker(5, 30)        // 连续5次 RPC 错误熔断，30s 缓慢恢复
+    .with_size_limits(2, 30)            // 请求体 2MB，Batch 最多 30 条
+
+    // ── P1 安全配置（推荐）──────────────────────────────────────────
+    .with_connection_limit(10, 5000)    // 每IP 10 连接，全局 5000
+    .with_audit_log()                   // 开启安全审计日志
+
+    // ── P2 安全配置（可选，disabled by default）─────────────────────
+    // .with_api_key({"secret-token"})  // API Key 认证
+    // .with_tls("cert.pem", "key.pem") // TLS（配置就绪，transport 待实现）
 
     // 构建（返回 unique_ptr<McpServer>）
     .build();

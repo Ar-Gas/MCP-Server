@@ -23,7 +23,12 @@
   - **Streamable HTTP**（`:8081`）：MCP 2025-11-25 单端点 `/mcp`，支持 JSON 直接响应与 SSE 流模式，`Mcp-Session-Id` header 会话管理。
   - **StdIO**：基于 `seastar::thread`，直接读 stdin / 写 stdout，兼容 Claude Desktop 等本地客户端。
 - **真正多核**：`sharded<McpShard>` 架构，每核独立 dispatcher 和 session map，`http_server_control` 连接自动分配到各核，跨核 SSE push 通过 `invoke_on` 完成。
-- **流式 Builder API**：`McpServerBuilder` 一链调用完成全部配置。
+- **内置安全防护**：开箱即用的网络安全层，通过 Builder 方法一行开启，无需修改业务代码：
+  - **P0 默认生效**：请求体大小限制（1 MB）、JSON-RPC Batch 大小限制（20 条）。
+  - **P0 可选**：IP 白名单/黑名单（CIDR）、Per-IP 速率限制（令牌桶）、Per-IP 熔断器（CLOSED/OPEN/HALF_OPEN）。
+  - **P1 可选**：SSE 连接数限制（per-IP + 全局）、安全审计日志。
+  - **P2 可选**：API Key / Bearer Token 认证、TLS 配置（transport 待实现）。
+- **流式 Builder API**：`McpServerBuilder` 一链调用完成全部配置，包含安全策略。
 
 ---
 
@@ -36,19 +41,24 @@
 │   ├── core/
 │   │   ├── interfaces.hh                     # McpTool / McpResource / McpPrompt 抽象基类
 │   │   ├── registry.hh                       # McpRegistry 统一注册表
-│   │   └── builder.hh                        # McpServerBuilder 流式配置 API
+│   │   └── builder.hh                        # McpServerBuilder 流式配置 API（含安全方法）
 │   ├── protocol/
 │   │   └── json_rpc.hh                       # JSON-RPC 2.0 协议类型与错误码
 │   ├── router/
-│   │   └── dispatcher.hh                     # 异步 JSON-RPC 路由调度器（含 Batch 支持）
+│   │   └── dispatcher.hh                     # 异步 JSON-RPC 路由调度器（含 Batch 大小限制）
 │   ├── transport/
 │   │   ├── transport.hh                      # ITransport 抽象接口 + SseSession 定义
 │   │   ├── stdio_transport.hh                # StdIO Transport（seastar::thread 实现）
-│   │   ├── http_sse_transport.hh             # HTTP/SSE Transport（多核）
-│   │   └── streamable_http_transport.hh      # Streamable HTTP Transport（MCP 2025-11-25）
-│   └── server/
-│       ├── mcp_shard.hh                      # McpShard：每核独立状态（dispatcher + sessions）
-│       └── mcp_server.hh                     # McpServer：持有 sharded<McpShard>
+│   │   ├── http_sse_transport.hh             # HTTP/SSE Transport（多核，含安全检查）
+│   │   └── streamable_http_transport.hh      # Streamable HTTP Transport（MCP 2025-11-25，含安全检查）
+│   ├── server/
+│   │   ├── mcp_shard.hh                      # McpShard：每核独立状态（dispatcher + sessions + 安全组件）
+│   │   └── mcp_server.hh                     # McpServer：持有 sharded<McpShard>
+│   └── security/                             # 安全模块（P0/P1 自动生效，P2 可选）
+│       ├── security_policy.hh                # 所有安全配置 struct + SecurityCheckResult 枚举
+│       ├── ip_filter.hh                      # IpFilter：CIDR 白名单/黑名单（IPv4）
+│       ├── rate_limiter.hh                   # PerIpRateLimiter：令牌桶限流
+│       └── circuit_breaker.hh               # PerIpCircuitBreaker：熔断器状态机
 ├── src/mcp/server/
 │   └── mcp_server.cc                         # MCP 方法注册与服务器实现
 ├── src/seastar_patches/
@@ -156,6 +166,32 @@ int main(int argc, char** argv) {
     });
 }
 ```
+
+### 4. 启用安全防护
+
+通过 Builder 方法逐步开启，无需修改业务代码：
+
+```cpp
+auto server = mcp::McpServerBuilder{}
+    .name("my-mcp-server")
+    // ── P0: 基础安全（推荐所有生产环境启用）──────────────────────
+    .with_ip_whitelist({"10.0.0.0/8", "192.168.0.0/16"}) // 仅内网可访问
+    .with_rate_limit(100, 200)       // 每IP 100 req/s，突发 200
+    .with_circuit_breaker(5, 30)     // 连续5次 RPC 错误熔断，30s 后缓慢恢复
+    // ── P1: 连接防护 ───────────────────────────────────────────────
+    .with_connection_limit(10, 5000) // 每IP最多10个SSE连接，全局最多5000
+    .with_audit_log()                // 开启安全审计日志（logger: mcp_security_audit）
+    // ── 调整默认大小限制（P0 默认：1MB body, 20条 batch）──────────
+    .with_size_limits(2, 50)         // 放宽至 2MB body, 50条 batch
+    // ── P2: 可选高级安全 ────────────────────────────────────────────
+    // .with_api_key({"my-secret-token"})  // API Key 认证（401 if missing）
+    // .with_tls("cert.pem", "key.pem")    // TLS（config 就绪，transport 待实现）
+    .with_http(8080)
+    .build();
+```
+
+> 安全检查在 transport 层最前端执行，在任何 JSON-RPC 解析之前完成，性能开销极低。
+> 详见 [`docs/security.md`](docs/security.md)。
 
 ---
 
@@ -362,6 +398,7 @@ mcp::McpServerBuilder{}
 |------|------|
 | [完整技术文档](docs/complete-guide.md) | 架构、模块、接口、测试、性能一站式文档（推荐） |
 | [系统架构](docs/architecture.md) | 分片模型、数据流、关键设计决策 |
+| [安全防护](docs/security.md) | 威胁模型、P0/P1/P2 安全配置详解、熔断器原理 |
 | [SDK API 参考](docs/api/) | McpTool / McpResource / McpPrompt / 高级接口 |
 | [Transport 层](docs/transports.md) | 三种传输方式详解 |
 | [测试指南](docs/testing.md) | 单元测试、集成测试、手动验证 |
