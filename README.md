@@ -8,19 +8,19 @@
 
 ## 核心特性
 
-- **极致性能**：基于 Seastar 异步 I/O 框架，Share-Nothing 架构，真正多核并行。在 2核4G 虚拟机上实测稳定并发 1500，峰值 QPS 破万，P95 延迟低于 85ms。
+- **极致性能**：基于 Seastar 异步 I/O 框架，Share-Nothing 架构，真正多核并行。在 2核4G 虚拟机上实测单核 QPS 超过 500，P95 延迟低于 100ms，零错误率。
 - **现代 C++**：全面拥抱 C++20 协程（`co_await` / `co_return`），SDK 接口简洁，无回调地狱。
-- **完整 MCP 协议支持**（`2024-11-05`）：
-  - **Tools**：工具调用，`isError` 字段自动处理，支持 cursor 分页。
-  - **Resources**：静态资源 + URI 模板动态资源，支持 cursor 分页。
-  - **Prompts**：带参数的提示词模板，支持 cursor 分页。
-  - **Completion**：客户端参数自动补全。
-  - **Logging**：`logging/setLevel` 动态调整 Seastar 全局日志级别。
+- **完整 MCP 协议支持**（`2025-11-25`）：
+  - **Tools**：工具调用，`isError` 字段自动处理，支持 cursor 分页，支持 outputSchema 和 annotations。
+  - **Resources**：静态资源 + URI 模板动态资源，支持 cursor 分页，支持订阅变更通知。
+  - **Prompts**：带参数的提示词模板，支持 cursor 分页，支持参数自动补全。
+  - **Logging**：`logging/setLevel` 动态调整 Seastar 全局日志级别，支持向客户端推送日志通知。
   - **Roots**：`roots/list` 返回服务端根列表。
   - **JSON-RPC Batch**：支持数组格式的批量请求，单次往返执行多条指令。
+  - **双向 RPC**：支持服务端向客户端发起 `sampling/createMessage` 和 `elicitation/create` 请求。
 - **三种 Transport，全部多核**：
   - **HTTP/SSE**（`:8080`）：GET `/sse` + POST `/message`，sessionId 会话管理，跨核 push 自动路由。
-  - **Streamable HTTP**（`:8081`）：MCP 2024-11-05 单端点 `/mcp`，支持 JSON 直接响应与 SSE 流模式，`Mcp-Session-Id` header 会话管理。
+  - **Streamable HTTP**（`:8081`）：MCP 2025-11-25 单端点 `/mcp`，支持 JSON 直接响应与 SSE 流模式，`Mcp-Session-Id` header 会话管理。
   - **StdIO**：基于 `seastar::thread`，直接读 stdin / 写 stdout，兼容 Claude Desktop 等本地客户端。
 - **真正多核**：`sharded<McpShard>` 架构，每核独立 dispatcher 和 session map，`http_server_control` 连接自动分配到各核，跨核 SSE push 通过 `invoke_on` 完成。
 - **流式 Builder API**：`McpServerBuilder` 一链调用完成全部配置。
@@ -45,17 +45,24 @@
 │   │   ├── transport.hh                      # ITransport 抽象接口 + SseSession 定义
 │   │   ├── stdio_transport.hh                # StdIO Transport（seastar::thread 实现）
 │   │   ├── http_sse_transport.hh             # HTTP/SSE Transport（多核）
-│   │   └── streamable_http_transport.hh      # Streamable HTTP Transport（MCP 2024-11-05）
+│   │   └── streamable_http_transport.hh      # Streamable HTTP Transport（MCP 2025-11-25）
 │   └── server/
 │       ├── mcp_shard.hh                      # McpShard：每核独立状态（dispatcher + sessions）
 │       └── mcp_server.hh                     # McpServer：持有 sharded<McpShard>
 ├── src/mcp/server/
 │   └── mcp_server.cc                         # MCP 方法注册与服务器实现
+├── src/seastar_patches/
+│   └── http_common_patch.cc                  # 修复 Seastar HTTP SSE flush bug
 ├── examples/demo/                            # 完整示例应用
 │   ├── main.cc                               # 使用 SDK 的示例入口
 │   ├── tools/                                # 示例 Tool 实现
 │   ├── resources/                            # 示例 Resource 实现
 │   └── prompts/                              # 示例 Prompt 实现
+├── tests/
+│   ├── unit/                                 # C++ 单元测试（Boost.Test + Seastar Testing）
+│   ├── integration/                          # Python 集成测试（pytest，21 个用例）
+│   └── perf/                                 # 性能压测脚本
+├── docs/                                     # 详细技术文档
 ├── Dockerfile
 └── CMakeLists.txt                            # 导出 mcp_sdk::mcp_sdk target
 ```
@@ -73,8 +80,8 @@ ninja
 ```
 
 编译产物：
-- `build/libmcp_sdk.a` — SDK 静态库
 - `build/examples/demo/demo_server` — 示例可执行文件
+- `build/tests/test_dispatcher`、`build/tests/test_registry` — 单元测试
 
 ---
 
@@ -175,7 +182,7 @@ npx @modelcontextprotocol/inspector ./build/examples/demo/demo_server -- -c 1 --
 # 初始化握手
 curl -s -X POST http://127.0.0.1:8080/message \
      -H 'Content-Type: application/json' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
 # 获取工具列表（支持 cursor 分页）
 curl -s -X POST http://127.0.0.1:8080/message \
@@ -192,10 +199,15 @@ curl -s -X POST http://127.0.0.1:8080/message \
      -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"sys://memory-info"}}'
 
+# 订阅资源变更（需先建立 SSE session）
+curl -s -X POST 'http://127.0.0.1:8080/message?sessionId=s0_1' \
+     -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":5,"method":"resources/subscribe","params":{"uri":"sys://memory-info"}}'
+
 # 获取提示词
 curl -s -X POST http://127.0.0.1:8080/message \
      -H 'Content-Type: application/json' \
-     -d '{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"analyze_server_health","arguments":{"focus":"memory"}}}'
+     -d '{"jsonrpc":"2.0","id":6,"method":"prompts/get","params":{"name":"analyze_server_health","arguments":{"focus":"memory"}}}'
 
 # JSON-RPC Batch（单次往返执行多条指令）
 curl -s -X POST http://127.0.0.1:8080/message \
@@ -205,7 +217,7 @@ curl -s -X POST http://127.0.0.1:8080/message \
 # 动态调整日志级别
 curl -s -X POST http://127.0.0.1:8080/message \
      -H 'Content-Type: application/json' \
-     -d '{"jsonrpc":"2.0","id":6,"method":"logging/setLevel","params":{"level":"debug"}}'
+     -d '{"jsonrpc":"2.0","id":7,"method":"logging/setLevel","params":{"level":"debug"}}'
 
 # SSE 长连接（另开终端）
 curl -N http://127.0.0.1:8080/sse
@@ -213,7 +225,7 @@ curl -N http://127.0.0.1:8080/sse
 
 </details>
 
-### 方法三：Streamable HTTP 模式（`:8081`，MCP 2024-11-05）
+### 方法三：Streamable HTTP 模式（`:8081`，MCP 2025-11-25）
 
 <details>
 <summary>展开查看 curl 测试命令</summary>
@@ -229,7 +241,7 @@ curl -s -X POST http://127.0.0.1:8081/mcp \
 curl -v -X POST http://127.0.0.1:8081/mcp \
      -H 'Content-Type: application/json' \
      -H 'Accept: text/event-stream' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
 # 向已有 session 发送请求（结果通过 SSE 流推送）
 curl -s -X POST http://127.0.0.1:8081/mcp \
@@ -317,17 +329,19 @@ mcp::McpServerBuilder{}
 
 ---
 
-## 已支持的 MCP 方法
+## 已支持的 MCP 方法（协议版本 2025-11-25）
 
 | 方法 | 说明 |
 |------|------|
-| `initialize` | 协议握手，返回服务端能力声明 |
+| `initialize` | 协议握手，返回 `protocolVersion: "2025-11-25"` 及服务端能力声明 |
 | `ping` | 心跳检测 |
-| `tools/list` | 列出所有工具（支持 cursor 分页） |
-| `tools/call` | 调用指定工具 |
+| `tools/list` | 列出所有工具（支持 cursor 分页，含 title / outputSchema / annotations） |
+| `tools/call` | 调用指定工具，自动补充 `isError: false` |
 | `resources/list` | 列出所有资源（支持 cursor 分页） |
 | `resources/templates/list` | 列出 URI 模板资源 |
-| `resources/read` | 读取资源内容 |
+| `resources/read` | 读取资源内容，支持动态 URI 模板 |
+| `resources/subscribe` | 订阅资源变更，断连自动清理 |
+| `resources/unsubscribe` | 取消资源订阅 |
 | `prompts/list` | 列出所有提示词模板（支持 cursor 分页） |
 | `prompts/get` | 获取并渲染提示词 |
 | `completion/complete` | 参数自动补全 |
@@ -335,3 +349,21 @@ mcp::McpServerBuilder{}
 | `roots/list` | 列出服务端根路径 |
 | `notifications/initialized` | 客户端初始化完成通知（no-op） |
 | `notifications/cancelled` | 请求取消通知（记录日志） |
+| `sampling/createMessage` | 服务端向客户端发起 LLM 推理请求（双向 RPC） |
+| `elicitation/create` | 服务端向客户端请求用户输入（双向 RPC） |
+
+---
+
+## 文档
+
+详细技术文档见 [`docs/`](docs/) 目录：
+
+| 文档 | 说明 |
+|------|------|
+| [完整技术文档](docs/complete-guide.md) | 架构、模块、接口、测试、性能一站式文档（推荐） |
+| [系统架构](docs/architecture.md) | 分片模型、数据流、关键设计决策 |
+| [SDK API 参考](docs/api/) | McpTool / McpResource / McpPrompt / 高级接口 |
+| [Transport 层](docs/transports.md) | 三种传输方式详解 |
+| [测试指南](docs/testing.md) | 单元测试、集成测试、手动验证 |
+| [性能压测](docs/benchmarking.md) | 基准测试方法与结果分析 |
+| [构建与部署](docs/build-deploy.md) | 依赖安装、编译参数、生产调优 |
