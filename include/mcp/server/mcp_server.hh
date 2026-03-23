@@ -1,96 +1,71 @@
 #pragma once
+#include "mcp/server/mcp_shard.hh"
+#include "mcp/transport/transport.hh"
 #include <seastar/core/future.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/queue.hh>
-#include <seastar/http/httpd.hh>
-#include <seastar/http/handlers.hh>
-#include <seastar/http/function_handlers.hh>
-#include "mcp/router/dispatcher.hh"
+#include <nlohmann/json.hpp>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace mcp::server {
 
-    struct SseSession {
-        seastar::queue<std::string> messages{100};
-        bool active = true;
-    };
+// McpServer：SDK 对外暴露的服务器主类
+// 内部通过 sharded<McpShard> 实现真正的多核并行
+// 通过 McpServerBuilder（见 core/builder.hh）创建
+class McpServer {
+    McpServerConfig _config;
+    std::shared_ptr<mcp::core::McpRegistry> _registry;
+    seastar::sharded<McpShard> _shards;
+    std::vector<std::unique_ptr<mcp::transport::ITransport>> _transports;
 
-    class McpServer {
-        seastar::httpd::http_server _server;
-        mcp::router::JsonRpcDispatcher _dispatcher;
-        std::unordered_map<std::string, std::shared_ptr<SseSession>> _sessions;
-        uint64_t _session_counter = 0;
+public:
+    McpServer(McpServerConfig config, std::shared_ptr<mcp::core::McpRegistry> registry)
+        : _config(std::move(config)), _registry(std::move(registry)) {}
 
-    public:
-        McpServer() : _server("mcp_server") {}
-        mcp::router::JsonRpcDispatcher& dispatcher() { return _dispatcher; }
+    void add_transport(std::unique_ptr<mcp::transport::ITransport> t) {
+        _transports.push_back(std::move(t));
+    }
 
-        seastar::future<> start(uint16_t port) {
-            set_routes(_server._routes);
-            return _server.listen(seastar::socket_address{seastar::ipv4_addr{port}});
-        }
-        seastar::future<> stop() { return _server.stop(); }
+    seastar::future<> start();
+    seastar::future<> stop();
 
-    private:
-        void set_routes(seastar::httpd::routes& r) {
-            // 修复点 1: function_handler 需要第二个参数指定默认 content-type
-            r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/sse"), 
-                new seastar::httpd::function_handler([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-                    return handle_sse(std::move(req), std::move(rep));
-                }, "txt")); 
-            
-            r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/message"), 
-                new seastar::httpd::function_handler([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-                    return handle_message(std::move(req), std::move(rep));
-                }, "json"));
-        }
+    seastar::sharded<McpShard>& shards()   { return _shards; }
+    mcp::core::McpRegistry&     registry() { return *_registry; }
+    const McpServerConfig&      config()   { return _config; }
 
-        seastar::future<std::unique_ptr<seastar::http::reply>> handle_sse(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-            std::string session_id = "sess_" + std::to_string(++_session_counter);
-            auto session = std::make_shared<SseSession>();
-            _sessions[session_id] = session;
+    // ── Phase 2a: 全核广播 resource 更新（SDK 用户在 resource 变化时调用）─────
+    seastar::future<> broadcast_resource_updated(const std::string& uri) {
+        return _shards.invoke_on_all([uri](McpShard& s) {
+            return s.notify_resource_updated(uri);
+        });
+    }
 
-            rep->set_content_type("text/event-stream");
-            rep->add_header("Cache-Control", "no-cache");
-            rep->add_header("Connection", "keep-alive");
+    // ── Phase 2c: 全核广播日志通知（SDK 用户工具内调用）──────────────────────
+    seastar::future<> broadcast_log_notification(
+            const std::string& level,
+            const std::string& logger_name,
+            const nlohmann::json& data) {
+        return _shards.invoke_on_all([level, logger_name, data](McpShard& s) {
+            return s.broadcast_log_notification(level, logger_name, data);
+        });
+    }
 
-            rep->write_body("text/event-stream", [session_id, session](seastar::output_stream<char>&& out) mutable -> seastar::future<> {
-                try {
-                    co_await out.write("event: endpoint\ndata: /message?sessionId=" + session_id + "\n\n");
-                    co_await out.flush();
-                    while (session->active) {
-                        auto msg = co_await session->messages.pop_eventually();
-                        if (msg.empty() || !session->active) break;
-                        co_await out.write("data: " + msg + "\n\n");
-                        co_await out.flush();
-                    }
-                } catch (...) { session->active = false; }
-                co_await out.close();
-            });
-            co_return std::move(rep);
-        }
+    // ── Phase 3: 向客户端发起 sampling / elicitation 请求 ────────────────────
+    // 必须在 session 所属核上调用（session_id 编码了 shard）
+    seastar::future<nlohmann::json> request_sampling(
+            const std::string& session_id,
+            const nlohmann::json& params) {
+        return _shards.local().send_request_to_client(
+            session_id, "sampling/createMessage", params);
+    }
 
-        seastar::future<std::unique_ptr<seastar::http::reply>> handle_message(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-            
-// 👇 开启编译器魔法：忽略废弃警告 (对 GCC 和 Clang 均有效)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-            // 底层已经将流读取完毕，数据一定在 content 中，直接取用
-            std::string body(req->content.data(), req->content.size());
-#pragma GCC diagnostic pop
-// 👆 恢复编译器警告设置
-            std::string session_id = req->get_query_param("sessionId");
-            
-            auto response_opt = co_await _dispatcher.handle_request(body);
-            if (!session_id.empty() && _sessions.contains(session_id)) {
-                if (response_opt) {
-                    (void)_sessions[session_id]->messages.push_eventually(std::move(*response_opt));
-                }
-                rep->set_status(seastar::http::reply::status_type::accepted);
-            } else {
-                if (response_opt) rep->write_body("json", *response_opt);
-                else rep->set_status(seastar::http::reply::status_type::accepted);
-            }
-            co_return std::move(rep);
-        }
-    };
-}
+    seastar::future<nlohmann::json> request_elicitation(
+            const std::string& session_id,
+            const nlohmann::json& params) {
+        return _shards.local().send_request_to_client(
+            session_id, "elicitation/create", params);
+    }
+};
+
+} // namespace mcp::server
+

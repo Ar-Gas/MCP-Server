@@ -1,38 +1,47 @@
 cmake_minimum_required(VERSION 3.15)
-project(SeastarMcpServer CXX)
+project(SeastarMcpSdk CXX)
 
-# 【新增这两行】消除 FetchContent 警告
 if(POLICY CMP0135)
     cmake_policy(SET CMP0135 NEW)
 endif()
 
-# Seastar 必须使用 C++20 才能开启协程 (co_await)
+# C++20 是必须的（Seastar 协程依赖）
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 1. 查找 Seastar 库 (请确保系统已安装 Seastar)
+# ─── 依赖 ────────────────────────────────────────────────────────────────────
+
 find_package(Seastar REQUIRED)
 
-# 2. 自动拉取并配置 nlohmann_json (无需手动安装)
-include(FetchContent)
-FetchContent_Declare(
-    json
-    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-)
-FetchContent_MakeAvailable(json)
+find_package(nlohmann_json 3.11 REQUIRED)
 
-# 3. 设置头文件搜索路径
-include_directories(include)
+# ─── SDK 库 target ───────────────────────────────────────────────────────────
 
-# 4. 编译可执行文件
-add_executable(mcp_server 
-    app/main.cc
-    src/mcp/handlers/mcp_handler.cc
+add_library(mcp_sdk OBJECT
+    src/mcp/server/mcp_server.cc
+    src/seastar_patches/http_common_patch.cc
 )
 
-# 5. 链接 Seastar 和 JSON 库
-target_link_libraries(mcp_server PRIVATE 
-    Seastar::seastar 
+target_include_directories(mcp_sdk PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(mcp_sdk PUBLIC
+    Seastar::seastar
     nlohmann_json::nlohmann_json
 )
+
+# Alias target：使用者可通过 mcp_sdk::mcp_sdk 引入
+add_library(mcp_sdk::mcp_sdk ALIAS mcp_sdk)
+
+# ─── 示例程序（可选）────────────────────────────────────────────────────────
+
+option(MCP_BUILD_EXAMPLES "Build example applications" ON)
+if(MCP_BUILD_EXAMPLES)
+    add_subdirectory(examples/demo)
+endif()
+
+enable_testing()
+add_subdirectory(tests)

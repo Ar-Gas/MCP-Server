@@ -1,0 +1,81 @@
+{
+  "generated": "2026-03-23 10:26:29",
+  "git_hash": "e268bfa",
+  "build": {
+    "status": "ok"
+  },
+  "unit": {
+    "status": "ok",
+    "passed": 2,
+    "failed": 0,
+    "output": "Test project /home/zyq/seastar-mcp-server/build\n    Start 1: test_dispatcher\n1/2 Test #1: test_dispatcher ..................   Passed    0.09 sec\n    Start 2: test_registry\n2/2 Test #2: test_registry ....................   Passed    0.08 sec\n\n100% tests passed, 0 tests failed out of 2\n\nTotal Test time (real) =   0.18 sec\n"
+  },
+  "integration": {
+    "status": "ok",
+    "passed": 18,
+    "failed": 0,
+    "error": 0,
+    "skipped": 0
+  },
+  "perf": {
+    "status": "ok",
+    "data": [
+      {
+        "name": "ping (SSE)",
+        "url": "http://127.0.0.1:8080/message",
+        "method": "ping",
+        "concurrency": 20,
+        "total": 300,
+        "rps": 542.4,
+        "mean_ms": 30.14,
+        "p50_ms": 27.09,
+        "p95_ms": 64.6,
+        "p99_ms": 90.46,
+        "error_rate": 0.0,
+        "errors": 0
+      },
+      {
+        "name": "tools/list (SSE)",
+        "url": "http://127.0.0.1:8080/message",
+        "method": "tools/list",
+        "concurrency": 20,
+        "total": 300,
+        "rps": 354.7,
+        "mean_ms": 43.26,
+        "p50_ms": 36.34,
+        "p95_ms": 98.77,
+        "p99_ms": 140.9,
+        "error_rate": 0.0,
+        "errors": 0
+      },
+      {
+        "name": "tools/call sum (SSE)",
+        "url": "http://127.0.0.1:8080/message",
+        "method": "tools/call",
+        "concurrency": 20,
+        "total": 300,
+        "rps": 472.2,
+        "mean_ms": 34.32,
+        "p50_ms": 32.2,
+        "p95_ms": 74.19,
+        "p99_ms": 100.84,
+        "error_rate": 0.0,
+        "errors": 0
+      },
+      {
+        "name": "ping (Streamable)",
+        "url": "http://127.0.0.1:8081/mcp",
+        "method": "ping",
+        "concurrency": 20,
+        "total": 300,
+        "rps": 482.0,
+        "mean_ms": 31.11,
+        "p50_ms": 28.67,
+        "p95_ms": 62.72,
+        "p99_ms": 86.1,
+        "error_rate": 0.0,
+        "errors": 0
+      }
+    ]
+  }
+}
